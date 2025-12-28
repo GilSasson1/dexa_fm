@@ -34,7 +34,7 @@ default_config = {
 FULL_BODY_MANIFEST = '/net/mraid20/export/genie/LabData/Analyses/gilsa/dxa_total_body_manifest.pkl'
 CROPS_MANIFEST = '/net/mraid20/export/genie/LabData/Analyses/gilsa/crops_manifest.pkl'
 TARGETS_CSV = '/home/gilsa/PycharmProjects/DEXA/targets_for_downstream_augmented.csv'
-CHECKPOINTS = '/net/mraid20/export/genie/LabData/Analyses/gilsa/checkpoints/dexa_fm/'
+CHECKPOINTS = '/net/mraid20/export/genie/LabData/Analyses/gilsa/checkpoints/lejepa_dexa/'
 
 # STATS
 DEXA_MEAN = [0.12394659966230392, 0.2626885771751404, 0.3075794577598572]
