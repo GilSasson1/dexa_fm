@@ -13,21 +13,24 @@ import wandb
 import os
 from transformers import get_cosine_schedule_with_warmup
 from lejepa_dataset import LeJEPADEXADataset
-from model import LeJEPA_Encoder
+from model import LeJEPA_Encoder, SIGReg
 from helpers import *
+from augmentations import LeJEPATransformConfig
 
 default_config = {
     "batch_size": 64,
-    "lr": 1e-3,
+    "lr": 1e-4,
     "probe_lr": 1e-3,
     "weight_decay": 5e-2,
-    "epochs": 200,
-    "lambda": 0.2,
-    "sigreg_slices": 2048,
+    "epochs": 250,
+    "lambda": 0.5,
+    "sigreg_slices": 4096,
     "warmup_epochs": 20,
     "global_views": 2,
     "local_views": 8,
-    "model_name": 'convnext_small',
+    "model_name": 'vit_small_patch16_224',
+    "drop_path": 0.1
+
 }
 
 # PATHS
@@ -36,106 +39,11 @@ CROPS_MANIFEST = '/net/mraid20/export/genie/LabData/Analyses/gilsa/crops_manifes
 TARGETS_CSV = '/home/gilsa/PycharmProjects/DEXA/targets_for_downstream_augmented.csv'
 CHECKPOINTS = '/net/mraid20/export/genie/LabData/Analyses/gilsa/checkpoints/lejepa_dexa/'
 
-# STATS
-DEXA_MEAN = [0.12394659966230392, 0.2626885771751404, 0.3075794577598572]
-DEXA_STD  = [0.21822425723075867, 0.31778785586357117, 0.3350508213043213]
-
 RESUME_FROM = None
-MODEL = 'vit_small_patch16_224'
 IS_PRETRAINED = False
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-run_name = f"LeJEPA_DEXA_{MODEL}_lr{default_config['lr']}lambda{default_config['lambda']}"
-
-class LeJEPATransformConfig:
-    """Holds the transformation pipelines"""
-    def __init__(self, global_size=224, local_size=96):
-        self.normalize = transforms.Normalize(mean=DEXA_MEAN, std=DEXA_STD)
-        self.to_float = transforms.ConvertImageDtype(torch.float)
-
-        self.fb_pre = transforms.Resize((256, 256), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True)
-        self.intensity_aug = transforms.ColorJitter(brightness=0.2, contrast=0.2)
-
-        # B. Global Transform
-        self.global_trans = transforms.Compose([
-            self.to_float,
-            transforms.RandomResizedCrop(global_size, scale=(0.3, 1.0), ratio=(0.9, 1.1), interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.RandomRotation(degrees=15),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomApply([transforms.GaussianBlur(5, .1)], p=0.5),
-            transforms.RandomApply([self.intensity_aug], p=0.8),
-            self.normalize
-        ])
-
-        # C. Local Transform
-        self.local_trans = transforms.Compose([
-            self.to_float,
-            transforms.RandomResizedCrop(local_size, scale=(0.25, 1.0), ratio=(0.75, 1.33), interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.RandomRotation(degrees=15),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomApply([self.intensity_aug], p=0.8),
-            self.normalize
-        ])
-
-        # D. Synthetic Local Source Transform
-        self.synthetic_local_trans = transforms.Compose([
-            self.to_float,
-            transforms.RandomResizedCrop(local_size, scale=(0.05, 0.3), ratio=(0.75, 1.33), interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.RandomRotation(degrees=15),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomApply([self.intensity_aug], p=0.8),
-            self.normalize
-        ])
-
-# Models & Loss
-class SIGReg(nn.Module):
-    def __init__(self, num_slices=2048, knots=17, integration_limit=5):
-        super().__init__()
-        self.num_slices = num_slices
-
-        # Pre-calculate integration points (The "Grid")
-        t = torch.linspace(-integration_limit, integration_limit, knots, dtype=torch.float32)
-        dt = (2 * integration_limit) / (knots - 1)
-        weights = torch.full((knots,), 2 * dt, dtype=torch.float32)
-        weights[[0, -1]] = dt
-
-        # Gaussian target function (The "Ideal Shape")
-        target_cf = torch.exp(-0.5 * t.square())
-
-        # Register as buffers so they move to GPU automatically but aren't trained
-        self.register_buffer("t", t.view(1, 1, -1)) # Shape for broadcasting
-        self.register_buffer("weights", weights)
-        self.register_buffer("target_cf", target_cf.view(1, -1))
-
-    def forward(self, z):
-        """
-        z: (Batch_Size * Views, Dim)
-        """
-        B, D = z.shape
-
-        # Generate Random Projections (The "Slices")
-        A = torch.randn(D, self.num_slices, device=z.device)
-        A = A.div_(A.norm(dim=0, keepdim=True) + 1e-6)
-
-        # Project Data -> (Batch, Slices)
-        z_proj = z @ A
-
-        # Compute Empirical Characteristic Function (ECF)
-        # val: (Batch, Slices, Knots)
-        val = z_proj.unsqueeze(-1) * self.t
-
-        # ecf: (Slices, Knots) -> Average over Batch
-        ecf_real = val.cos().mean(dim=0)
-        ecf_imag = val.sin().mean(dim=0)
-
-        # Compute Weighted Error
-        diff = (ecf_real - self.target_cf).square() + ecf_imag.square()
-
-        # Integrate error (Trapezoidal rule)
-        loss_per_slice = diff @ self.weights
-
-        # Return Mean over slices
-        return loss_per_slice.mean()
+run_name = f"{default_config['model_name']}_lr{default_config['lr']}lambda{default_config['lambda']}"
 
 
 class OnlineLinearProbe(nn.Module):
@@ -234,7 +142,7 @@ def main():
     )
 
     # Model Setup
-    encoder = LeJEPA_Encoder(default_config["model_name"], proj_out_dim=64, pretrained=IS_PRETRAINED).to(DEVICE)
+    encoder = LeJEPA_Encoder(default_config["model_name"], proj_out_dim=64, pretrained=IS_PRETRAINED, drop_path_rate=default_config['drop_path']).to(DEVICE)
     probe = OnlineLinearProbe(encoder.embed_dim).to(DEVICE)
 
     # SIGREG_SLICES -> default_config["sigreg_slices"]

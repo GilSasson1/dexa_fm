@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 
-def insure_indices_format(df):
+def insure_indices_format(df, is_index=True):
     df['RegistrationCode'] = df['RegistrationCode'].astype(str).apply(lambda x: f"10K_{x}" if not x.startswith("10K_") else x)
     df['research_stage']  = df['research_stage'].replace('00_00_visit', 'baseline')
     return df
