@@ -3,7 +3,7 @@ import timm
 import torch
 
 class LeJEPA_Encoder(nn.Module):
-    def __init__(self, model_name='resnet50', proj_out_dim=256, pretrained=False, drop_path_rate=0.0):
+    def __init__(self, model_name='resnet50', img_size=(224, 224), proj_out_dim=256, pretrained=False, drop_path_rate=0.0):
         super().__init__()
 
         # ViTs usually use the [CLS] token.
@@ -11,6 +11,7 @@ class LeJEPA_Encoder(nn.Module):
         is_vit = 'vit' in model_name or 'swin' in model_name
 
         model_kwargs = {
+            "img_size": img_size,
             "pretrained": pretrained,
             "num_classes": 0,
             "drop_path_rate": drop_path_rate,

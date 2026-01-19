@@ -4,94 +4,77 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
-import torchvision.transforms as transforms
 from tqdm import tqdm
-from PIL import Image
 from model import LeJEPA_Encoder
-
-# STATS
-DEXA_MEAN = [0.12394659966230392, 0.2626885771751404, 0.3075794577598572]
-DEXA_STD  = [0.21822425723075867, 0.31778785586357117, 0.3350508213043213]
+from augmentations import val_transforms
+from lejepa_dataset import LeJEPAHDF5Dataset
 
 # --- CONFIGURATION ---
 MODEL_NAME = 'vit_small_patch16_224'
-MODEL_PATH = "/net/mraid20/export/genie/LabData/Analyses/gilsa/checkpoints/lejepa_dexa/sweep_winner.pth"
-OUTPUT_PATH = "/net/mraid20/export/genie/LabData/Analyses/gilsa/embeddings/lejepa/sweep_winner.pkl"
+MODEL_PATH = "/net/mraid20/export/genie/LabData/Analyses/gilsa/checkpoints/lejepa_dexa/best_model_new_dataset_test_final.pth"
+OUTPUT_PATH = "/net/mraid20/export/genie/LabData/Analyses/gilsa/embeddings/lejepa/vit_small_new_data.pkl"
+HDF5_PATH = '/net/mraid20/export/genie/LabData/Data/10K/aws_lab_files/dxa/dxa_dataset.h5'
+
 BATCH_SIZE = 256
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+N_GLOBAL_VIEWS = 4 # TTA Views
 
-# Path to your manifest dataframe (pickle or csv)
-MANIFEST_PATH = "/net/mraid20/export/genie/LabData/Analyses/gilsa/dxa_total_body_manifest.pkl"
-
-class DEXAExtractionDataset(Dataset):
-    def __init__(self, manifest_df, transform=None):
-        self.manifest = manifest_df
-        self.transform = transform
+class InferenceDatasetWrapper(Dataset):
+    """
+    Wraps the standard LeJEPAHDF5Dataset to return Metadata (IDs)
+    alongside the images.
+    """
+    def __init__(self, base_dataset):
+        self.base = base_dataset
 
     def __len__(self):
-        return len(self.manifest)
-
-    def _normalize_to_uint8(self, arr):
-        """Robust normalization to 0-255 uint8"""
-        arr = arr.astype(np.float32)
-        if arr.ndim == 2:
-            arr = np.stack([arr]*3, axis=-1)
-
-        min_val, max_val = arr.min(), arr.max()
-        if max_val - min_val > 1e-6:
-            arr = (arr - min_val) / (max_val - min_val)
-        else:
-            arr = np.zeros_like(arr)
-
-        return (arr * 255).astype(np.uint8)
-
-    def load_image(self, path):
-        """Helper to load .npy or image files safely"""
-        if path.endswith('.npy'):
-            arr = np.load(path)
-            return self._normalize_to_uint8(arr)
-        else:
-            # Fallback for jpg/png
-            return np.array(Image.open(path).convert('RGB'))
+        return len(self.base)
 
     def __getitem__(self, idx):
-        row = self.manifest.iloc[idx]
-        reg_code = row['RegistrationCode']
-        visit_id = row['research_stage'] if 'research_stage' in row else 'baseline'
+        # 1. Get the standard data (views, target)
+        # We ignore 'target' for extraction
+        views, _ = self.base[idx]
 
-        # 1. Load Data (Bone, Tissue, Composite)
-        bone_img = self.load_image(row['Path_Bone'])
-        tissue_img = self.load_image(row['Path_Tissue'])
-        comp_img = self.load_image(row['Path_Composite'])
+        # 2. Get the Metadata manually
+        # We access the internal keys/file of the base dataset
+        self.base._open_h5()
+        key = self.base.keys[idx]
+        group = self.base.h5_file[key]
 
-        # 2. Resize to Match Composite (Anchor)
-        h, w = comp_img.shape[:2]
+        # Extract IDs
+        # Note: Adjust attribute names if your HDF5 uses different casing
+        reg_code = group.attrs.get('RegistrationCode', 'Unknown')
+        visit_id = group.attrs.get('research_stage', 'Unknown')
 
-        # Simple resize helper using PIL for speed/quality
-        def resize_np(img, th, tw):
-            if img.shape[0] != th or img.shape[1] != tw:
-                return np.array(Image.fromarray(img).resize((tw, th), Image.BICUBIC))
-            return img
+        # Convert strings if they are bytes
+        if isinstance(reg_code, bytes): reg_code = reg_code.decode('utf-8')
+        if isinstance(visit_id, bytes): visit_id = visit_id.decode('utf-8')
 
-        bone_img = resize_np(bone_img, h, w)
-        tissue_img = resize_np(tissue_img, h, w)
+        return views, reg_code, visit_id
 
-        # 3. Stack Channels (Channels First: 3, H, W)
-        # Result is (3, H, W)
-        img_array = np.stack([bone_img[..., 0], tissue_img[..., 0], comp_img[..., 0]], axis=0)
-        img_tensor = torch.tensor(img_array, dtype=torch.uint8)
+def inference_collate_fn(batch):
+    """
+    Custom collate to handle the list of views.
+    Returns:
+        collated_views: Tensor of shape (Batch_Size, N_Views, 3, H, W)
+        reg_codes: List
+        visit_ids: List
+    """
+    views_list, reg_codes, visit_ids = zip(*batch)
 
-        # 4. Apply Transforms
-        if self.transform:
-            img_tensor = self.transform(img_tensor)
+    # views_list is a tuple of lists: ( [View1_A, View2_A...], [View1_B, View2_B...] )
+    # We want to stack them: (Batch, N_Views, C, H, W)
 
-        return img_tensor, reg_code, visit_id
+    # 1. Stack views for each patient -> (N_Views, C, H, W)
+    patient_stacks = [torch.stack(v) for v in views_list]
+
+    # 2. Stack patients -> (Batch, N_Views, C, H, W)
+    batch_tensor = torch.stack(patient_stacks)
+
+    return batch_tensor, reg_codes, visit_ids
 
 def clean_state_dict(checkpoint):
-    """
-    Fixes the 'projector' size mismatch by removing projector weights.
-    We don't need the projector for embeddings anyway.
-    """
+    """Removes projector weights."""
     if 'encoder' in checkpoint:
         state_dict = checkpoint['encoder']
     else:
@@ -99,108 +82,112 @@ def clean_state_dict(checkpoint):
 
     new_state_dict = {}
     for k, v in state_dict.items():
-        # Clean prefix 'module.' (DDP artifact)
         name = k[7:] if k.startswith('module.') else k
-
-        # 1. REMOVE PROJECTOR (Fixes size mismatch error)
         if "projector" in name or "head" in name:
             continue
-
         new_state_dict[name] = v
-
     return new_state_dict
 
 def main():
-    print(f"--- Setting up Embedding Extraction on {DEVICE} ---")
+    print(f"--- Extraction Started on {DEVICE} ---")
 
-    # 1. Initialize Model
-    # We don't care about proj_dim here because we won't load those weights
-    model = LeJEPA_Encoder(MODEL_NAME).to(DEVICE)
+    # 1. Setup Dataset
+    val_transform = val_transforms(global_size=(384, 128))
+
+    base_dataset = LeJEPAHDF5Dataset(
+        hdf5_path=HDF5_PATH,
+        keys=None,  # Use all keys
+        targets_df=None, # No targets needed for extraction
+        transform=val_transform,
+        n_global=N_GLOBAL_VIEWS,
+        n_local=0
+    )
+
+    # Wrap it to get IDs
+    dataset = InferenceDatasetWrapper(base_dataset)
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=4,
+        collate_fn=inference_collate_fn
+    )
+
+    # 2. Setup Model
+    print(f"Initializing {MODEL_NAME}...")
+    model = LeJEPA_Encoder(MODEL_NAME, img_size=(384, 128)).to(DEVICE)
     model.eval()
 
-    # 2. Load Weights (With Cleaning)
+    # 3. Load Weights
     if os.path.exists(MODEL_PATH):
-        print(f"Loading weights from {MODEL_PATH}...")
+        print(f"Loading checkpoint: {MODEL_PATH}")
         checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
-
-        # Clean the dictionary to remove the mismatching projector
         clean_dict = clean_state_dict(checkpoint)
-
-        # Load with strict=False (allows missing projector weights)
         msg = model.load_state_dict(clean_dict, strict=False)
         print(f"Weights Loaded. Missing keys (expected): {msg.missing_keys}")
     else:
-        raise FileNotFoundError(f"Model path {MODEL_PATH} not found.")
-
-    # 3. Setup Data
-    print("Loading Manifest...")
-    # Load your manifest however you prefer (pickle, csv)
-    # Ensure it has 'Path_Bone', 'Path_Tissue', 'Path_Composite'
-    try:
-        manifest = pd.read_pickle(MANIFEST_PATH)
-    except:
-        manifest = pd.read_csv(MANIFEST_PATH) # Fallback
-
-    print(f"Found {len(manifest)} samples.")
-
-    # Define Transform (Standard Validation Preprocessing)
-    extract_transform = transforms.Compose([
-        transforms.ConvertImageDtype(torch.float),
-        transforms.Resize((256, 256), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True),
-        transforms.CenterCrop(224),
-        # Use the mean/std we calculated before
-        transforms.Normalize(mean=DEXA_MEAN, std=DEXA_STD),
-    ])
-
-    dataset = DEXAExtractionDataset(manifest, transform=extract_transform)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+        raise FileNotFoundError(f"Checkpoint not found at {MODEL_PATH}")
 
     # 4. Extraction Loop
     embeddings_list = []
     indices_list = []
 
-    print("Starting Extraction...")
+    print("Extracting features...")
     with torch.no_grad():
-        for imgs, reg_codes, visit_ids in tqdm(dataloader):
-            imgs = imgs.to(DEVICE)
+        for img_stack, reg_codes, visit_ids in tqdm(dataloader):
+
+            # img_stack shape: (Batch, N_Views, 3, H, W)
+            bs, n_views, c, h, w = img_stack.shape
+
+            # Flatten to feed into model: (Batch * N_Views, 3, H, W)
+            flat_imgs = img_stack.view(-1, c, h, w).to(DEVICE)
 
             # Forward Pass
-            # LeJEPA usually returns (features, projections). We want features.
-            output = model(imgs)
+            output = model(flat_imgs)
 
+            # Handle output format
             if isinstance(output, tuple):
-                feats = output[0] # Backbone features
+                feats = output[0]
             else:
                 feats = output
 
-            # Handle ViT [CLS] token if needed
+            # Global Average Pooling if needed (Check dimensions)
+            # ViT Small usually returns (B, Dim) for CLS if pooled=True in timm,
+            # or (B, N_Patches, Dim). LeJEPA_Encoder usually returns (B, Dim) CLS.
             if feats.dim() == 3:
-                # (B, N, D) -> Take CLS token at index 0
+                # Take CLS token (Index 0)
                 feats = feats[:, 0]
 
-            embeddings_list.append(feats.cpu().numpy())
+            # Reshape back to (Batch, N_Views, Dim)
+            dim = feats.shape[-1]
+            feats = feats.view(bs, n_views, dim)
 
-            # Store IDs
+            # MEAN POOLING over the N_Global Views (TTA)
+            # This gives one robust embedding per patient
+            feats_avg = feats.mean(dim=1)
+
+            embeddings_list.append(feats_avg.cpu().numpy())
+
+            # Collect Index
             for r, v in zip(reg_codes, visit_ids):
                 indices_list.append((r, v))
 
-    # 5. Save Results
-    print("Compiling Results...")
+    #  Save Results
+    print("Compiling DataFrame...")
     all_embeddings = np.vstack(embeddings_list)
 
-    # Create MultiIndex
+    # Create Index
     index = pd.MultiIndex.from_tuples(indices_list, names=['RegistrationCode', 'research_stage'])
 
-    # Create DataFrame
-    # Columns: emb_0, emb_1, ...
+    # Columns
     cols = [f"emb_{i}" for i in range(all_embeddings.shape[1])]
     df_emb = pd.DataFrame(all_embeddings, index=index, columns=cols)
 
-    # Create directory if missing
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-
     df_emb.to_pickle(OUTPUT_PATH)
-    print(f"SUCCESS: Saved {len(df_emb)} embeddings to {OUTPUT_PATH}")
+
+    print(f" DONE. Saved {len(df_emb)} embeddings to {OUTPUT_PATH}")
 
 if __name__ == "__main__":
     main()
