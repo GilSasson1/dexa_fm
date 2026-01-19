@@ -15,20 +15,21 @@ from lejepa_dataset import LeJEPADEXADataset
 from model import LeJEPA_Encoder, SIGReg
 from helpers import *
 from augmentations import LeJEPATransformConfig
+import matplotlib.pyplot as plt
 
 # --- CONFIGURATION ---
 default_config = {
-    "batch_size": 64,
+    "batch_size": 32,
     "lr": 1e-4,
     "probe_lr": 1e-3,
     "weight_decay": 5e-2,
     "epochs": 200,
     "lambda": 0.2,
-    "sigreg_slices": 4096,
+    "sigreg_slices": 2048,
     "warmup_epochs": 20,
     "global_views": 2,
     "local_views": 8,
-    "model_name": 'vit_small_patch16_224', #
+    "model_name": 'vit_small_patch16_224',
     "drop_path": 0.1
 }
 
@@ -37,7 +38,7 @@ FULL_BODY_MANIFEST = '/net/mraid20/export/genie/LabData/Analyses/gilsa/dxa_total
 CROPS_MANIFEST = '/net/mraid20/export/genie/LabData/Analyses/gilsa/crops_manifest.pkl'
 TARGETS_CSV = '/home/gilsa/PycharmProjects/DEXA/targets_for_downstream_augmented.csv'
 CHECKPOINTS_DIR = '/net/mraid20/export/genie/LabData/Analyses/gilsa/checkpoints/lejepa_scaling/'
-DINO_PKL_PATH = '/net/mraid20/export/genie/LabData/Analyses/gilsa/embeddings/dexa_zeroshot.pkl'
+DINO_PKL_PATH = '/net/mraid20/export/genie/LabData/Analyses/gilsa/dino_zeroshot_small.pkl'
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -67,6 +68,7 @@ def evaluate_dino_from_pickle(pkl_path, train_ids, val_ids, targets_df):
         return 0.0
 
     print(embeddings.head())
+    embeddings = insure_indices_format(embeddings)
     embeddings.set_index(['RegistrationCode', 'research_stage'], inplace=True)
 
     # Align Indices
@@ -93,10 +95,46 @@ def evaluate_dino_from_pickle(pkl_path, train_ids, val_ids, targets_df):
     print(f"[DINO] Baseline R2: {score:.4f}")
     return score
 
+
+def plot_results(lejepa_results, dino_baseline, save_dir):
+    """
+    Plots the Scaling Law Graph: LeJEPA vs DINO
+    lejepa_results: dict {0.1: 0.45, 0.25: 0.55, ...}
+    dino_baseline: float (e.g., 0.65)
+    """
+    # Sort data just in case
+    ratios = sorted(lejepa_results.keys())
+    scores = [lejepa_results[r] for r in ratios]
+
+    # Convert ratios to percentages for X-axis
+    x_pct = [r * 100 for r in ratios]
+
+    plt.figure(figsize=(10, 6))
+
+    # 1. Plot DINO Baseline (Red Line)
+    plt.axhline(y=dino_baseline, color='red', linestyle='--', linewidth=2,
+                label=f'DINO Baseline (R²={dino_baseline:.3f})')
+
+    # 2. Plot LeJEPA Curve (Blue Line)
+    plt.plot(x_pct, scores, marker='o', linewidth=2, color='blue', label='LeJEPA (Scratch)')
+
+    # 3. Aesthetics
+    plt.xlabel('Percentage of Training Data Used (%)', fontsize=12)
+    plt.ylabel('Validation R² Score (Age Prediction)', fontsize=12)
+    plt.title('Scaling Law: LeJEPA vs. DINO', fontsize=14)
+    plt.grid(True, linestyle=':', alpha=0.6)
+    plt.legend()
+
+    # 4. Save
+    save_path = os.path.join(save_dir, 'scaling_law_graph.png')
+    plt.savefig(save_path, dpi=300)
+    print(f"\n[GRAPH] Saved scaling graph to: {save_path}")
+    plt.close()
+
 # --- MAIN EXPERIMENT ---
 
 def main():
-    wandb.init(entity="gilsasson12-weizmann-institute-of-science", project="LeJEPA_Scaling_Graph", name="Scaling_Experiment_v1")
+    wandb.init(entity="gilsasson12-weizmann-institute-of-science", project="LeJEPA_Scaling_Graph", name="Scaling_Experiment_v3")
     os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
 
     # 1. PREPARE DATA
@@ -154,10 +192,9 @@ def main():
         manifest_keys = pd.MultiIndex.from_frame(train_manifest_subset[['RegistrationCode', 'research_stage']])
         targets_train_subset = targets_orig.reindex(manifest_keys)
 
-        train_dataset = LeJEPADEXADataset(
-            train_manifest_subset, targets_train_subset, LeJEPATransformConfig(),
-            n_global=default_config["global_views"], n_local=default_config["local_views"]
-        )
+        train_dataset = LeJEPADEXADataset(train_manifest_subset, targets_train_subset, LeJEPATransformConfig(),
+                                          n_global=default_config["global_views"],
+                                          n_local=default_config["local_views"])
 
         train_loader = DataLoader(
             train_dataset, batch_size=default_config["batch_size"],
@@ -272,6 +309,8 @@ def main():
     print("\n=== FINAL SCALING RESULTS ===")
     print(f"DINO Baseline: {dino_r2}")
     print(f"LeJEPA Results: {results}")
+
+    plot_results(results, dino_r2, CHECKPOINTS_DIR)
 
 if __name__ == "__main__":
     main()
