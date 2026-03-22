@@ -8,8 +8,8 @@ import torchvision.transforms.functional as TF
 
 # --- Configuration ---
 FULL_BODY_SCANS_CACHE = "/net/mraid20/export/genie/LabData/Analyses/gilsa/dxa_total_body_manifest.pkl"
-IMG_HEIGHT = 416
-IMG_WIDTH = 128
+IMG_HEIGHT = 256
+IMG_WIDTH = 256
 
 class DEXADataset(Dataset):
     def __init__(self, samples, targets_df=None, target_cols=None, transform=None):
@@ -31,30 +31,39 @@ class DEXADataset(Dataset):
             # 1. Load Data
             bone_np = np.load(row['Path_Bone']).astype(np.float32) / 255.0
             tissue_np = np.load(row['Path_Tissue']).astype(np.float32) / 255.0
-            comp_np = np.load(row['Path_Composite']).astype(np.float32) / 255.0
+            # comp_np = np.load(row['Path_Composite']).astype(np.float32) / 255.0
 
             if bone_np.ndim < 2: raise ValueError("Corrupt Image")
 
             # 2. Convert to Tensor [C, H, W]
             t_bone = torch.tensor(bone_np).unsqueeze(0)
             t_tissue = torch.tensor(tissue_np).unsqueeze(0)
-            t_comp = torch.tensor(comp_np).unsqueeze(0)
+            # t_comp = torch.tensor(comp_np).unsqueeze(0)
 
-            # This ensures all channels are (416, 128) and aligned before concatenation
+            # This ensures all channels are (256, 256) and aligned before concatenation
             target_size = (IMG_HEIGHT, IMG_WIDTH)
 
-            t_bone = TF.resize(t_bone, target_size, interpolation=TF.InterpolationMode.BILINEAR, antialias=True)
-            t_tissue = TF.resize(t_tissue, target_size, interpolation=TF.InterpolationMode.BILINEAR, antialias=True)
-            t_comp = TF.resize(t_comp, target_size, interpolation=TF.InterpolationMode.BILINEAR, antialias=True)
+            t_bone = TF.resize(t_bone, target_size, interpolation=TF.InterpolationMode.BICUBIC, antialias=True)
+            t_tissue = TF.resize(t_tissue, target_size, interpolation=TF.InterpolationMode.BICUBIC, antialias=True)
+            # t_comp = TF.resize(t_comp, target_size, interpolation=TF.InterpolationMode.BILINEAR, antialias=True)
 
-            # 4. Concatenate
-            img_tensor = torch.cat([t_bone, t_tissue, t_comp], dim=0)
+            # --- ORIGINAL: 3-channel stacking (commented out) ---
+            # # 4. Concatenate
+            # img_tensor = torch.cat([t_bone, t_tissue, t_comp], dim=0)
+
+            # --- EXPERIMENT: Separate bone and tissue as 3-channel images ---
+            # Replicate bone scan to 3 channels (for bone embedding)
+            bone_3ch = torch.cat([t_bone, t_bone, t_bone], dim=0)
+            # Replicate tissue scan to 3 channels (for tissue embedding)
+            tissue_3ch = torch.cat([t_tissue, t_tissue, t_tissue], dim=0)
 
             if self.transform:
-                img_tensor = self.transform(img_tensor)
+                bone_3ch = self.transform(bone_3ch)
+                tissue_3ch = self.transform(tissue_3ch)
 
             if self.targets_df is None or self.target_cols is None:
-                return img_tensor, (sample_id, visit_id)
+                # Return both image tensors for separate embeddings
+                return (bone_3ch, tissue_3ch), (sample_id, visit_id)
             # 1. Robust Lookup
             try:
                 # Try MultiIndex
@@ -71,8 +80,8 @@ class DEXADataset(Dataset):
             # .values converts Series -> Numpy Array -> Float
             target_values = labels_row[self.target_cols].values.astype(np.float32)
 
-            # Return shape: [C, H, W], [Num_Targets]
-            return img_tensor, torch.tensor(target_values)
+            # Return shape: (bone_3ch, tissue_3ch), [Num_Targets]
+            return (bone_3ch, tissue_3ch), torch.tensor(target_values)
 
         except Exception as e:
             print(f"Error loading sample {sample_id} at index {idx}: {e}")

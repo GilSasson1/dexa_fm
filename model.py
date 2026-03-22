@@ -11,13 +11,13 @@ class LeJEPA_Encoder(nn.Module):
         is_vit = 'vit' in model_name or 'swin' in model_name
 
         model_kwargs = {
-            "img_size": img_size,
             "pretrained": pretrained,
             "num_classes": 0,
             "drop_path_rate": drop_path_rate,
         }
 
         if is_vit:
+            model_kwargs['img_size'] = img_size
             model_kwargs["dynamic_img_size"] = True
             model_kwargs['global_pool'] = 'token' # Use [CLS] token for ViTs
         else:
@@ -29,14 +29,15 @@ class LeJEPA_Encoder(nn.Module):
         self.backbone = timm.create_model(model_name, **model_kwargs)
         self.embed_dim = self.backbone.num_features
 
-        # Projector (The "Expander")
         # Standard design: input_dim -> 2048 -> 2048 -> proj_out_dim
         self.projector = nn.Sequential(
-            nn.Linear(self.embed_dim, 2048, bias=False),
+            nn.Linear(self.embed_dim, 2048),
+            nn.BatchNorm1d(2048),
             nn.ReLU(),
-            nn.Linear(2048, 2048, bias=False),
+            nn.Linear(2048, 2048),
+            nn.BatchNorm1d(2048),
             nn.ReLU(),
-            nn.Linear(2048, proj_out_dim, bias=False),
+            nn.Linear(2048, proj_out_dim),
         )
 
     def forward(self, x):
@@ -50,46 +51,43 @@ class SIGReg(nn.Module):
         super().__init__()
         self.num_slices = num_slices
 
-        # Pre-calculate integration points (The "Grid")
-        t = torch.linspace(-integration_limit, integration_limit, knots, dtype=torch.float32)
-        dt = (2 * integration_limit) / (knots - 1)
+        # OPTIMIZATION: Integrate only [0, limit] instead of [-limit, limit]
+        # This doubles the resolution (dt is smaller) for the same cost.
+        t = torch.linspace(0, integration_limit, knots, dtype=torch.float32)
+        
+        # Calculate dt for the half-range
+        dt = integration_limit / (knots - 1)
+        
+        # Standard Trapezoidal Weights for [0, limit]
         weights = torch.full((knots,), 2 * dt, dtype=torch.float32)
         weights[[0, -1]] = dt
 
-        # Gaussian target function (The "Ideal Shape")
         target_cf = torch.exp(-0.5 * t.square())
 
-        # Register as buffers so they move to GPU automatically but aren't trained
-        self.register_buffer("t", t.view(1, 1, -1)) # Shape for broadcasting
+        self.register_buffer("t", t.view(1, 1, -1))
         self.register_buffer("weights", weights)
         self.register_buffer("target_cf", target_cf.view(1, -1))
 
     def forward(self, z):
-        """
-        z: (Batch_Size * Views, Dim)
-        """
-        B, D = z.shape
+        B, D = z.shape 
 
-        # Generate Random Projections (The "Slices")
+        # Projections
         A = torch.randn(D, self.num_slices, device=z.device)
-        A = A.div_(A.norm(dim=0, keepdim=True) + 1e-6)
+        A = A / (A.norm(dim=0, keepdim=True) + 1e-6)  # Normalize each column to unit length
+        z_proj = z @ A 
 
-        # Project Data -> (Batch, Slices)
-        z_proj = z @ A
-
-        # Compute Empirical Characteristic Function (ECF)
-        # val: (Batch, Slices, Knots)
+        # ECF
         val = z_proj.unsqueeze(-1) * self.t
-
-        # ecf: (Slices, Knots) -> Average over Batch
         ecf_real = val.cos().mean(dim=0)
         ecf_imag = val.sin().mean(dim=0)
 
-        # Compute Weighted Error
+        # Error
         diff = (ecf_real - self.target_cf).square() + ecf_imag.square()
+        diff = diff * self.target_cf 
 
-        # Integrate error (Trapezoidal rule)
-        loss_per_slice = diff @ self.weights
+        # Integrate
+        # Because we baked the "* 2.0" into the weights, this result 
+        # automatically represents the full [-5, 5] integral.
+        loss_per_slice = diff @ self.weights 
 
-        # Return Mean over slices
-        return loss_per_slice.mean()
+        return loss_per_slice.mean() * B
