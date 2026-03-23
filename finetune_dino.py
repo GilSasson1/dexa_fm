@@ -29,7 +29,7 @@ FINAL_EMBEDDINGS_PATH = "/net/mraid20/export/genie/LabData/Analyses/gilsa/dexa_e
 WANDB_PROJECT = "DEXA_DINO_FineTuning"
 WANDB_ENTITY = "gilsasson12-weizmann-institute-of-science"
 TARGET_COLUMN = 'age'
-RUN_NAME = 'DINOv3_FT_Age_LateFusion_PEFT'  # Example: 'DINOv3_FT_Age_LateFusion_PEFT'
+RUN_NAME = 'DINOv3_FT_Age_LateFusion_PEFT_fixed_leakage'  # Example: 'DINOv3_FT_Age_LateFusion_PEFT'
 MODEL_NAME = 'vit_large_patch16_dinov3.lvd1689m'
 
 # ---------------------------------------------------------
@@ -223,12 +223,41 @@ if __name__ == "__main__":
     target_df.sort_index(inplace=True)
 
     valid_keys = []
+    subject_to_keys = {}
     for k in all_keys:
         parts = k.split('_')
-        idx = ("_".join(parts[:2]), "_".join(parts[2:]))
-        if idx in target_df.index: valid_keys.append(k)
+        s_id = "_".join(parts[:2])
+        idx = (s_id, "_".join(parts[2:]))
+        if idx in target_df.index:
+            valid_keys.append(k)
+            if s_id not in subject_to_keys:
+                subject_to_keys[s_id] = []
+            subject_to_keys[s_id].append(k)
 
-    train_keys, val_keys = train_test_split(valid_keys, test_size=0.2, random_state=42)
+    valid_subjects = sorted(subject_to_keys.keys())
+    train_subjects, val_subjects = train_test_split(valid_subjects, test_size=0.2, random_state=73)
+
+    train_subjects = set(train_subjects)
+    val_subjects = set(val_subjects)
+    subject_overlap = train_subjects.intersection(val_subjects)
+    if subject_overlap:
+        raise ValueError(f"Subject leakage detected. Overlap count={len(subject_overlap)}")
+
+    train_keys, val_keys = [], []
+    for s in sorted(train_subjects):
+        train_keys.extend(subject_to_keys[s])
+    for s in sorted(val_subjects):
+        val_keys.extend(subject_to_keys[s])
+
+    train_key_subjects = {"_".join(k.split('_')[:2]) for k in train_keys}
+    val_key_subjects = {"_".join(k.split('_')[:2]) for k in val_keys}
+    key_subject_overlap = train_key_subjects.intersection(val_key_subjects)
+    if key_subject_overlap:
+        raise ValueError(f"Key-level subject leakage detected. Overlap count={len(key_subject_overlap)}")
+
+    print(f"Valid labeled keys: {len(valid_keys)}")
+    print(f"Train subjects: {len(train_subjects)} | Val subjects: {len(val_subjects)}")
+    print(f"Train keys: {len(train_keys)} | Val keys: {len(val_keys)}")
 
     # --- TRANSFORMS ---
     train_trans = make_transform(resize_size=256)
@@ -240,7 +269,6 @@ if __name__ == "__main__":
     loader_train = DataLoader(ds_train, batch_size=BATCH_SIZE, shuffle=True, num_workers=8)
     loader_val = DataLoader(ds_val, batch_size=BATCH_SIZE, shuffle=False, num_workers=8)
 
-    # --- SETUP FOR FULL FINE-TUNING ---
     wandb.init(entity=WANDB_ENTITY, project=WANDB_PROJECT, name=RUN_NAME, config={"peft": USE_PEFT, "freeze_backbone": FREEZE_BACKBONE, "fusion_strategy": FUSION_STRATEGY})
 
     model = get_model()
@@ -257,7 +285,7 @@ if __name__ == "__main__":
     criterion = nn.MSELoss()
     best_r2 = -float('inf')
 
-    print("Starting Full Fine-Tuning...")
+    print("Starting Fine-Tuning...")
 
     for epoch in range(50):
         model.train()
